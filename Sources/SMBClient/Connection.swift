@@ -9,6 +9,24 @@ public class Connection {
   private let queue: DispatchQueue
   private var buffer = Data()
 
+  // Set by Session once SMB3 encryption keys are derived. When a received
+  // message begins with the TRANSFORM_HEADER protocolId, it is decrypted to the
+  // underlying SMB2 message before any header parsing.
+  //
+  // Written via `setDecryptor` (which hops onto `queue`) and only ever read in
+  // `decryptIfNeeded`, which runs inside the NWConnection receive callback on
+  // `queue`. Keeping both on the serial `queue` gives a clean happens-before so
+  // there is no data race on this field across the async executor / connection
+  // queue boundary.
+  private var decryptor: ((Data) throws -> Data)?
+
+  /// Install (or clear) the decrypt hook. Routed through the connection's serial
+  /// `queue` so it is ordered with the receive-path reads of `decryptor`. Called
+  /// from Session's async context (never from `queue`), so `sync` can't deadlock.
+  func setDecryptor(_ decryptor: ((Data) throws -> Data)?) {
+    queue.sync { self.decryptor = decryptor }
+  }
+
   private let semaphore = Semaphore(value: 1)
 
   public var state: NWConnection.State {
@@ -166,8 +184,15 @@ public class Connection {
         self.receive(upTo: length) { (result) in
           switch result {
           case .success:
-            let data = Data(self.buffer.prefix(length))
+            var data = Data(self.buffer.prefix(length))
             self.buffer = Data(self.buffer.suffix(from: length))
+
+            do {
+              data = try self.decryptIfNeeded(data)
+            } catch {
+              completion(.failure(error))
+              return
+            }
 
             let reader = ByteReader(data)
             var offset = 0
@@ -194,8 +219,16 @@ public class Connection {
                     return
                   }
 
-                  let data = transportPacket.smb2Message
+                  let data0 = transportPacket.smb2Message
                   self.buffer = Data(self.buffer.suffix(from: 4 + length))
+
+                  let data: Data
+                  do {
+                    data = try self.decryptIfNeeded(Data(data0))
+                  } catch {
+                    completion(.failure(error))
+                    return
+                  }
 
                   let reader = ByteReader(data)
                   let header: Header = reader.read()
@@ -234,8 +267,19 @@ public class Connection {
     }
   }
 
-  private func receive(upTo byteCount: Int, completion: @escaping (Result<(), Error>) -> Void) {
-    let minimumIncompleteLength = 1
+  private func decryptIfNeeded(_ data: Data) throws -> Data {
+    guard data.count >= 4, let decryptor else { return data }
+    // TRANSFORM_HEADER protocolId 0x424D53FD on the wire is bytes FD 53 4D 42.
+    if data[data.startIndex] == 0xFD,
+       data[data.startIndex + 1] == 0x53,
+       data[data.startIndex + 2] == 0x4D,
+       data[data.startIndex + 3] == 0x42 {
+      return try decryptor(data)
+    }
+    return data
+  }
+
+  private func receive(upTo byteCount: Int, completion: @escaping (Result<(), Error>) -> Void) {    let minimumIncompleteLength = 1
     let maximumLength = 65536
 
     if self.buffer.count < byteCount {
