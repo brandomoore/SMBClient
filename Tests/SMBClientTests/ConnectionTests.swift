@@ -3,6 +3,149 @@ import Network
 @testable import SMBClient
 
 final class ConnectionTests: XCTestCase {
+  func testShortSMBHeaderReturnsErrorInsteadOfCrashing() async throws {
+    let frame = DirectTCPPacket(smb2Message: Data(repeating: 0, count: 31)).encoded()
+    let (listener, port) = try await startMockServer(
+      script: ServerScript(fragments: [frame]), serverDone: nil
+    )
+    defer { listener.cancel() }
+    let connection = Connection(host: "127.0.0.1", port: Int(port))
+    defer { connection.disconnect() }
+    do {
+      _ = try await connection.send(smb2Message(status: 0))
+      XCTFail("A short SMB header must be rejected.")
+    } catch {
+      guard let error = error as? ConnectionError, case .invalidResponse = error else {
+        return XCTFail("Expected invalidResponse, got \(error)")
+      }
+    }
+  }
+
+  func testMalformedResponseEnvelopesAreRejectedBeforeDecoding() throws {
+    let header = smb2Message(status: 0)
+    var invalid = (0..<64).map { Data(header.prefix($0)) }
+    var badProtocol = header
+    badProtocol[0] = 0
+    invalid.append(badProtocol)
+    var badSize = header
+    badSize[4] = 63
+    invalid.append(badSize)
+    for next in [UInt32(1), 63, 64, 65, 128, UInt32.max] {
+      var compound = Header(command: .echo, nextCommand: next, messageId: 0, sessionId: 0).encoded()
+      if next == 65 { compound += header }
+      invalid.append(compound)
+    }
+    for count in 0..<4 {
+      invalid.append(smb2Message(status: 0xC0000022) + Data(count: count))
+    }
+    for data in invalid {
+      XCTAssertThrowsError(try Connection.isCompleteResponse(data)) { error in
+        guard let error = error as? ConnectionError, case .invalidResponse = error else {
+          return XCTFail("Expected invalidResponse, got \(error)")
+        }
+      }
+    }
+    XCTAssertThrowsError(try Connection.isCompleteResponse(
+      smb2Message(status: 0xC0000022) + Data(count: 4)
+    )) { XCTAssertTrue($0 is ErrorResponse) }
+    XCTAssertFalse(try Connection.isCompleteResponse(smb2Message(status: 0x00000103)))
+    XCTAssertTrue(try Connection.isCompleteResponse(header))
+    XCTAssertTrue(try Connection.isCompleteResponse((Data([0]) + header).dropFirst()))
+  }
+
+  func testCompoundResponseIsReturnedExactlyOnce() async throws {
+    let first = Header(command: .echo, nextCommand: 64, messageId: 0, sessionId: 0).encoded()
+    let body = first + smb2Message(status: 0)
+    let (listener, port) = try await startMockServer(
+      script: ServerScript(fragments: [DirectTCPPacket(smb2Message: body).encoded()]), serverDone: nil
+    )
+    defer { listener.cancel() }
+    let connection = Connection(host: "127.0.0.1", port: Int(port))
+    defer { connection.disconnect() }
+    let response = try await connection.send(smb2Message(status: 0))
+    XCTAssertEqual(response, body)
+  }
+
+  func testPendingChainConsumesOnlyOneExactSuccessFrame() async throws {
+    let pending = DirectTCPPacket(smb2Message: smb2Message(status: 0x00000103)).encoded()
+    let success = smb2Message(status: 0)
+    let frame = DirectTCPPacket(smb2Message: success).encoded()
+    let (listener, port) = try await startMockServer(
+      script: ServerScript(fragments: [pending + pending + frame + frame]), serverDone: nil
+    )
+    defer { listener.cancel() }
+    let connection = Connection(host: "127.0.0.1", port: Int(port))
+    defer { connection.disconnect() }
+    let response = try await connection.send(success)
+    XCTAssertEqual(response, success)
+  }
+
+  func testDecryptedShortHeaderIsRejected() async throws {
+    var encrypted = Data(repeating: 0, count: 116)
+    encrypted.replaceSubrange(0..<4, with: [0xFD, 0x53, 0x4D, 0x42])
+    let (listener, port) = try await startMockServer(
+      script: ServerScript(fragments: [DirectTCPPacket(smb2Message: encrypted).encoded()]), serverDone: nil
+    )
+    defer { listener.cancel() }
+    let connection = Connection(host: "127.0.0.1", port: Int(port))
+    defer { connection.disconnect() }
+    connection.setDecryptor { _ in Data(count: 10) }
+    do {
+      _ = try await connection.send(smb2Message(status: 0))
+      XCTFail("A decrypted short header must be rejected.")
+    } catch {
+      guard let error = error as? ConnectionError, case .invalidResponse = error else {
+        return XCTFail("Expected invalidResponse, got \(error)")
+      }
+    }
+  }
+
+  func testInvalidTransportAndCompoundFramesAreRejected() async throws {
+    let success = smb2Message(status: 0)
+    var invalidType = DirectTCPPacket(smb2Message: success).encoded()
+    invalidType[0] = 1
+    let badCompound = Header(command: .echo, nextCommand: 64, messageId: 0, sessionId: 0).encoded()
+    let frames = [
+      DirectTCPPacket(smb2Message: Data()).encoded(),
+      invalidType,
+      DirectTCPPacket(smb2Message: badCompound).encoded()
+    ]
+    for frame in frames {
+      let (listener, port) = try await startMockServer(
+        script: ServerScript(fragments: [frame]), serverDone: nil
+      )
+      defer { listener.cancel() }
+      let connection = Connection(host: "127.0.0.1", port: Int(port))
+      defer { connection.disconnect() }
+      do {
+        _ = try await connection.send(success)
+        XCTFail("Expected invalidResponse.")
+      } catch {
+        guard let error = error as? ConnectionError, case .invalidResponse = error else {
+          return XCTFail("Expected invalidResponse, got \(error)")
+        }
+      }
+    }
+  }
+
+  func testEOFInsideDeclaredFrameThrowsDisconnected() async throws {
+    let frame = DirectTCPPacket(smb2Message: smb2Message(status: 0)).encoded()
+    let (listener, port) = try await startMockServer(
+      script: ServerScript(fragments: [Data(frame.dropLast())]), serverDone: nil
+    )
+    defer { listener.cancel() }
+    let connection = Connection(host: "127.0.0.1", port: Int(port))
+    defer { connection.disconnect() }
+    do {
+      _ = try await connection.send(smb2Message(status: 0))
+      XCTFail("Expected disconnected for an incomplete frame.")
+    } catch {
+      guard let error = error as? ConnectionError, case .disconnected = error else {
+        return XCTFail("Expected disconnected, got \(error)")
+      }
+    }
+  }
+
   /// Returns a 64-byte encoded SMB2 header with the given status patched in.
   private func smb2Message(status: UInt32) -> Data {
     var data = Header(command: .echo, messageId: 0, sessionId: 0).encoded()

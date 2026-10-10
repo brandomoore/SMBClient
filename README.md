@@ -82,6 +82,20 @@ let data = try await client.download(path: "Pictures/IMG_0001.jpg")
 try await client.upload(data: data, path: "Documents/Presentations/Keynote.key")
 ```
 
+## Receive framing
+
+`Connection` buffers fragmented Direct TCP frames and returns each completed SMB2
+response once. Interim `STATUS_PENDING` frames are drained through the same
+framing path, including when later frames are already buffered. SMB2 header size,
+protocol identifier, compound offsets, and the fields read by `ErrorResponse`
+are validated before decoding, including after SMB3 decryption. Invalid envelopes
+throw `ConnectionError.invalidResponse` and close the connection; EOF inside a
+declared frame throws `ConnectionError.disconnected`.
+
+Self-contained framing and cryptography regressions can run without a Samba
+server using `swift test --filter 'ConnectionTests|CryptoTests'`. These checks
+cover the receive envelope, not every command-specific payload decoder.
+
 ## Example Applications
 
 ### Network File Browser for macOS

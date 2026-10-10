@@ -145,125 +145,71 @@ public class Connection {
   }
 
   private func receive(completion: @escaping (Result<Data, Error>) -> Void) {
-    let minimumIncompleteLength = 1
-    let maximumLength = 65536
-
-    connection.receive(
-      minimumIncompleteLength: minimumIncompleteLength,
-      maximumLength: maximumLength)
-    { (content, contentContext, isComplete, error) in
-      if let error = error {
+    receive(upTo: 4) { result in
+      if case .failure(let error) = result {
         completion(.failure(error))
         return
       }
-
-      guard let content else {
-        if isComplete {
-          completion(.failure(ConnectionError.disconnected))
-        } else {
-          self.receive(completion: completion)
-        }
+      let transportPacket = DirectTCPPacket(response: self.buffer)
+      let length = Int(transportPacket.protocolLength)
+      guard self.buffer.first == 0, length >= 64 else {
+        self.disconnect()
+        completion(.failure(ConnectionError.invalidResponse))
         return
       }
-
-      self.buffer.append(Data(content))
-
-      self.receive(upTo: 4) { (headerResult) in
-        switch headerResult {
+      self.buffer = Data(transportPacket.smb2Message)
+      self.receive(upTo: length) { result in
+        switch result {
         case .failure(let error):
           completion(.failure(error))
-          return
         case .success:
-          break
-        }
-
-        let transportPacket = DirectTCPPacket(response: self.buffer)
-        let length = Int(transportPacket.protocolLength)
-        self.buffer = Data(transportPacket.smb2Message)
-
-        self.receive(upTo: length) { (result) in
-          switch result {
-          case .success:
-            var data = Data(self.buffer.prefix(length))
-            self.buffer = Data(self.buffer.suffix(from: length))
-
-            do {
-              data = try self.decryptIfNeeded(data)
-            } catch {
-              completion(.failure(error))
-              return
+          let packet = Data(self.buffer.prefix(length))
+          self.buffer = Data(self.buffer.dropFirst(length))
+          do {
+            let data = try self.decryptIfNeeded(packet)
+            if try Self.isCompleteResponse(data) {
+              completion(.success(data))
+            } else {
+              // Drain already-buffered frames too, without recursively growing the stack.
+              self.queue.async { self.receive(completion: completion) }
             }
-
-            let reader = ByteReader(data)
-            var offset = 0
-
-            var header: Header
-            var response = Data()
-            repeat {
-              header = reader.read()
-
-              switch NTStatus(header.status) {
-              case
-                .success,
-                .moreProcessingRequired,
-                .noMoreFiles,
-                .endOfFile:
-                response += data
-              case .pending:
-                if self.buffer.count >= 4 {
-                  let transportPacket = DirectTCPPacket(response: self.buffer)
-                  let length = Int(transportPacket.protocolLength)
-
-                  if self.buffer.count < 4 + length {
-                    self.receive(completion: completion)
-                    return
-                  }
-
-                  let data0 = transportPacket.smb2Message
-                  self.buffer = Data(self.buffer.suffix(from: 4 + length))
-
-                  let data: Data
-                  do {
-                    data = try self.decryptIfNeeded(Data(data0))
-                  } catch {
-                    completion(.failure(error))
-                    return
-                  }
-
-                  let reader = ByteReader(data)
-                  let header: Header = reader.read()
-
-                  switch NTStatus(header.status) {
-                  case
-                    .success,
-                    .moreProcessingRequired,
-                    .noMoreFiles,
-                    .endOfFile:
-                    response += data
-                    break
-                  default:
-                    completion(.failure(ErrorResponse(data: data)))
-                    return
-                  }
-                } else {
-                  self.receive(completion: completion)
-                  return
-                }
-              default:
-                completion(.failure(ErrorResponse(data: Data(data[offset...]))))
-                return
-              }
-
-              offset += Int(header.nextCommand)
-              reader.seek(to: offset)
-            } while header.nextCommand > 0
-
-            completion(.success(response))
-          case .failure(let error):
+          } catch {
+            if error is ConnectionError { self.disconnect() }
             completion(.failure(error))
           }
         }
       }
+    }
+  }
+
+  /// Validate the envelope before any unchecked Header or ErrorResponse decoding.
+  static func isCompleteResponse(_ data: Data) throws -> Bool {
+    let bytes = Data(data)
+    var offset = 0
+    while true {
+      let remaining = bytes.count - offset
+      guard remaining >= 64 else { throw ConnectionError.invalidResponse }
+      let header = Header(data: Data(bytes[offset..<(offset + 64)]))
+      guard header.protocolId == 0x424D53FE, header.structureSize == 64 else {
+        throw ConnectionError.invalidResponse
+      }
+      let next = Int(header.nextCommand)
+      guard next == 0 || (next >= 64 && next.isMultiple(of: 8) && next <= remaining - 64) else {
+        throw ConnectionError.invalidResponse
+      }
+      switch NTStatus(header.status) {
+      case .success, .moreProcessingRequired, .noMoreFiles, .endOfFile:
+        break
+      case .pending:
+        guard offset == 0, next == 0 else { throw ConnectionError.invalidResponse }
+        return false
+      default:
+        let commandLength = next == 0 ? remaining : next
+        guard commandLength >= 68 else { throw ConnectionError.invalidResponse }
+        throw ErrorResponse(data: Data(bytes[offset..<(offset + commandLength)]))
+      }
+      if next == 0 { return true }
+      offset += next
     }
   }
 
@@ -279,7 +225,8 @@ public class Connection {
     return data
   }
 
-  private func receive(upTo byteCount: Int, completion: @escaping (Result<(), Error>) -> Void) {    let minimumIncompleteLength = 1
+  private func receive(upTo byteCount: Int, completion: @escaping (Result<(), Error>) -> Void) {
+    let minimumIncompleteLength = 1
     let maximumLength = 65536
 
     if self.buffer.count < byteCount {
@@ -299,6 +246,10 @@ public class Connection {
         }
 
         self.buffer.append(data)
+        if isComplete && self.buffer.count < byteCount {
+          completion(.failure(ConnectionError.disconnected))
+          return
+        }
         self.receive(upTo: byteCount, completion: completion)
       }
       return
@@ -312,4 +263,5 @@ public enum ConnectionError: Error {
   case disconnected
   case cancelled
   case unknown
+  case invalidResponse
 }
