@@ -57,40 +57,12 @@ public class Connection {
   }
 
   public func connect() async throws {
-    return try await withCheckedThrowingContinuation { (continuation) in
-      connection.stateUpdateHandler = { [weak self] (state) in
-        switch state {
-        case .setup, .preparing:
-          break
-        case .waiting(let error):
-          continuation.resume(throwing: error)
-          self?.connection.stateUpdateHandler = nil
-        case .ready:
-          continuation.resume()
-          // NWConnection delivers all state updates on `queue`, so assigning
-          // stateUpdateHandler here is safe: it runs on the same serial queue
-          // as any future state updates.
-          self?.connection.stateUpdateHandler = { [weak self] state in
-            switch state {
-            case .waiting(let error), .failed(let error):
-              self?.onDisconnected(error)
-            case .setup, .preparing, .ready, .cancelled:
-              break
-            @unknown default:
-              break
-            }
-          }
-        case .failed(let error):
-          continuation.resume(throwing: error)
-          self?.connection.stateUpdateHandler = nil
-        case .cancelled:
-          continuation.resume(throwing: ConnectionError.cancelled)
-          self?.connection.stateUpdateHandler = nil
-        @unknown default:
-          break
-        }
-      }
-
+    return try await withCheckedThrowingContinuation { continuation in
+      let handler = ConnectionStateHandler(
+        completion: { continuation.resume(with: $0) },
+        onDisconnected: { [weak self] in self?.onDisconnected($0) }
+      )
+      connection.stateUpdateHandler = handler.handle
       connection.start(queue: queue)
     }
   }
@@ -256,6 +228,56 @@ public class Connection {
     }
 
     completion(.success(()))
+  }
+}
+
+/// Replacing NWConnection's callback cannot revoke callbacks already enqueued.
+/// Consume connection completion before resuming its continuation instead.
+final class ConnectionStateHandler {
+  private let lock = NSLock()
+  private var completion: ((Result<Void, Error>) -> Void)?
+  private var established = false
+  private let onDisconnected: (Error) -> Void
+
+  init(
+    completion: @escaping (Result<Void, Error>) -> Void,
+    onDisconnected: @escaping (Error) -> Void
+  ) {
+    self.completion = completion
+    self.onDisconnected = onDisconnected
+  }
+
+  func handle(_ state: NWConnection.State) {
+    let result: Result<Void, Error>
+    let disconnection: Error?
+    switch state {
+    case .ready:
+      result = .success(())
+      disconnection = nil
+    case .waiting(let error), .failed(let error):
+      result = .failure(error)
+      disconnection = error
+    case .cancelled:
+      result = .failure(ConnectionError.cancelled)
+      disconnection = nil
+    case .setup, .preparing:
+      return
+    @unknown default:
+      return
+    }
+
+    lock.lock()
+    let completion = self.completion
+    self.completion = nil
+    if completion != nil, case .success = result { established = true }
+    let notifyDisconnection = completion == nil && established
+    lock.unlock()
+
+    if let completion {
+      completion(result)
+    } else if notifyDisconnection, let disconnection {
+      onDisconnected(disconnection)
+    }
   }
 }
 

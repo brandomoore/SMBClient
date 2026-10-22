@@ -82,7 +82,12 @@ let data = try await client.download(path: "Pictures/IMG_0001.jpg")
 try await client.upload(data: data, path: "Documents/Presentations/Keynote.key")
 ```
 
-## Receive framing
+## Connection lifecycle and receive framing
+
+Connection establishment consumes its completion once, even if network-state
+callbacks were queued before a failure or cancellation. Later failures on an
+established connection still reach `onDisconnected`; they never resume the
+completed connection continuation.
 
 `Connection` buffers fragmented Direct TCP frames and returns each completed SMB2
 response once. Interim `STATUS_PENDING` frames are drained through the same

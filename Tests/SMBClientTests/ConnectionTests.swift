@@ -3,6 +3,65 @@ import Network
 @testable import SMBClient
 
 final class ConnectionTests: XCTestCase {
+  func testConnectionCompletionIsConsumedBeforeQueuedTerminalStates() async throws {
+    let networkError = NWError.posix(.ENETDOWN)
+    let sequences: [[NWConnection.State]] = [
+      [.waiting(networkError), .waiting(networkError), .failed(networkError), .cancelled, .ready],
+      [.failed(networkError), .failed(networkError), .cancelled, .ready],
+      [.cancelled, .waiting(networkError), .cancelled, .ready],
+      [.setup, .preparing, .ready, .ready, .waiting(networkError), .failed(networkError), .cancelled]
+    ]
+    for states in sequences {
+      var completions = 0
+      var disconnections = 0
+      let result: Result<Void, Error> = await withCheckedContinuation { continuation in
+        let handler = ConnectionStateHandler(
+          completion: {
+            completions += 1
+            continuation.resume(returning: $0)
+          },
+          onDisconnected: { _ in disconnections += 1 }
+        )
+        for state in states { handler.handle(state) }
+      }
+      XCTAssertEqual(completions, 1)
+      switch states[0] {
+      case .setup:
+        try result.get()
+        XCTAssertEqual(disconnections, 2)
+      case .cancelled:
+        XCTAssertThrowsError(try result.get()) {
+          guard case ConnectionError.cancelled = $0 else {
+            return XCTFail("Expected the initial cancellation, got \($0)")
+          }
+        }
+        XCTAssertEqual(disconnections, 0)
+      default:
+        XCTAssertThrowsError(try result.get()) {
+          XCTAssertEqual($0 as? NWError, networkError)
+        }
+        XCTAssertEqual(disconnections, 0)
+      }
+    }
+  }
+
+  func testConnectionCompletionCanReenterWithoutResumingAgain() {
+    var completions = 0
+    var disconnections = 0
+    var handler: ConnectionStateHandler!
+    handler = ConnectionStateHandler(
+      completion: { _ in
+        completions += 1
+        handler.handle(.waiting(.posix(.ENETDOWN)))
+      },
+      onDisconnected: { _ in disconnections += 1 }
+    )
+    handler.handle(.ready)
+    XCTAssertEqual(completions, 1)
+    XCTAssertEqual(disconnections, 1)
+    handler = nil
+  }
+
   func testShortSMBHeaderReturnsErrorInsteadOfCrashing() async throws {
     let frame = DirectTCPPacket(smb2Message: Data(repeating: 0, count: 31)).encoded()
     let (listener, port) = try await startMockServer(
